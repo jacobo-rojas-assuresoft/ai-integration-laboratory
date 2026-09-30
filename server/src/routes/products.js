@@ -13,9 +13,10 @@ const SELECT_BY_PRICE_RANGE = db.prepare(
 const SELECT_BY_CATEGORY_AND_PRICE_RANGE = db.prepare(
   'SELECT id, name, category, price, stock FROM products WHERE category = ? AND price BETWEEN ? AND ? ORDER BY id',
 );
-const COUNT_CHEAPER_IN_CATEGORY = db.prepare(
-  'SELECT COUNT(*) AS count FROM products WHERE category = ? AND price < ?',
-);
+const CHEAPER_RANKS = db.prepare(`
+  SELECT id, RANK() OVER (PARTITION BY category ORDER BY price) - 1 AS cheaperInCategory
+  FROM products
+`);
 
 productsRouter.get('/', (req, res) => {
   const { category, minPrice, maxPrice } = req.query;
@@ -34,10 +35,15 @@ productsRouter.get('/', (req, res) => {
     rows = SELECT_ALL.all();
   }
 
-  const withRanking = rows.map((row) => {
-    const { count } = COUNT_CHEAPER_IN_CATEGORY.get(row.category, row.price);
-    return { ...row, cheaperInCategory: count };
-  });
+  const cheaperById = new Map();
+  for (const { id, cheaperInCategory } of CHEAPER_RANKS.all()) {
+    cheaperById.set(id, cheaperInCategory);
+  }
+
+  const withRanking = rows.map((row) => ({
+    ...row,
+    cheaperInCategory: cheaperById.get(row.id) ?? 0,
+  }));
 
   res.json(withRanking);
 });
