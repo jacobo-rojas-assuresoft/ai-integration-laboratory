@@ -238,6 +238,40 @@ También verifiqué que la descripción no atribuye al cambio el cálculo de `ch
 Los problemas detectados en el código (falta de validación, entradas inválidas que devuelven 200 con lista vacía, parámetros vacíos con comportamiento asimétrico) se documentaron en la descripción del PR, pero no se corrigieron: el desafío consiste en describir el cambio existente, no en modificarlo.
 
 
+## Desafío 3 — Optimización de GET /api/products
+
+### Diagnóstico
+`GET /api/products` presentaba un patrón **N+1**: después de obtener el listado, ejecutaba `COUNT_CHEAPER_IN_CATEGORY` una vez por cada producto para calcular `cheaperInCategory` (`server/src/routes/products.js`). Con 500 productos eran **501 consultas por request**. Según `EXPLAIN QUERY PLAN`, cada una hacía `SCAN products` (recorrido completo de la tabla), porque no existen índices aparte de la clave primaria.
+
+### Optimización aplicada
+El cálculo de `cheaperInCategory` se reemplazó por una sola consulta con la función de ventana:
+
+`RANK() OVER (PARTITION BY category ORDER BY price) - 1`
+
+`RANK()` asigna a cada producto 1 más la cantidad de productos de su categoría con precio estrictamente menor, y los empates reciben el mismo valor. Restando 1 se obtiene exactamente el conteo que hacía la consulta original (`price < ?`). La consulta se calcula sobre **toda la tabla**, sin los filtros de la petición, así que el valor sigue siendo sobre toda la categoría aunque se filtre por precio. Ahora se ejecutan **2 consultas por request**. No se agregó ningún índice: las mediciones no mostraron que fuera necesario.
+
+### Evidencia antes / después
+Tiempo de respuesta, promedio de 50 peticiones con `curl`:
+
+| Caso | Antes (N+1) | Intento 1 (self-join) | Final (`RANK()`) |
+|---|---|---|---|
+| Sin filtros (500 productos) | 23,9 ms | 10,4 ms | **3,6 ms** |
+| `category=Libros&minPrice=10&maxPrice=50` (1 producto) | 0,9 ms | 7,9 ms | **1,8 ms** |
+
+Plan de ejecución:
+- **Antes:** `COUNT_CHEAPER_IN_CATEGORY` → `SCAN products`, ejecutada 500 veces por request.
+- **Después:** `CHEAPER_RANKS` → `CO-ROUTINE (subquery-2)`, `SCAN products`, `USE TEMP B-TREE FOR ORDER BY`, `SCAN (subquery-2)`: una sola pasada con un ordenamiento.
+
+**Compensación aceptada:** el caso filtrado pasó de 0,9 ms a 1,8 ms, porque el ranking siempre recorre y ordena la tabla completa. A cambio, el caso principal es unas 6,6 veces más rápido.
+
+### Revisión humana
+- **Los datos no cambiaron:** guardé las respuestas del endpoint antes del cambio (sin filtros, por categoría, por rango de precio y combinado) y las comparé byte a byte con `cmp` después de la optimización. Las cuatro son idénticas.
+- **Cuestioné el diagnóstico de la IA:** afirmaba que sin un índice el problema no se resolvería, contradiciendo su propia observación de que escanear 500 filas es barato. Pedí empezar por el cambio mínimo y medir; el índice resultó innecesario.
+- **Detecté una regresión en la primera propuesta:** el self-join mejoraba el caso sin filtros, pero hacía el caso filtrado unas 9 veces más lento. La IA no había considerado ese caso; lo encontré porque medí ambos. Con esa evidencia pedí la versión con `RANK()`.
+- **Invalidé mediciones contaminadas:** mientras la IA aplicaba el primer diff en dos partes, el servidor (con `--watch`) se reinició en un estado intermedio y respondió con errores `ReferenceError`. Reinicié el servidor, comprobé que respondía 200 y repetí las mediciones antes de usarlas.
+
+### Mejora futura (fuera de alcance)
+Cuando la petición filtra por `category`, el ranking podría calcularse solo sobre esa categoría, lo que seguiría siendo correcto porque se particiona por categoría. Así se reduciría el costo fijo del caso filtrado. No se aplicó porque agrega complejidad para una ganancia menor a 1 ms.
 
 
 ## Prompt log
@@ -257,5 +291,8 @@ Los problemas detectados en el código (falta de validación, entradas inválida
 | [D2] Pedí una descripción de PR para un revisor sin contexto (contexto, propósito, cambios y checklist de pruebas con casos límite), basada solo en el diff y señalando aparte cualquier posible problema. Sin modificar archivos. | ⚠️ Sugerencia incorrecta. Estructura correcta y sin validaciones inventadas, pero usaba la categoría `electronics`, que no existe (las reales están en español); dejaba como pregunta abierta si `minPrice=abc` producía un error 500; y omitía el caso `maxPrice=` (vacío). Al probar con curl: `minPrice=abc` y `maxPrice=` devuelven 200 con lista vacía. | Pedí corregir la descripción con los resultados reales de curl: usar la categoría `Libros`, poner resultados esperados según lo observado, agregar el caso `maxPrice=` y aclarar que entradas inválidas o vacías devuelven 200 con lista vacía. | La IA solo veía el diff: no conocía las categorías reales ni el comportamiento en ejecución. Las pruebas con curl mostraron que su hipótesis del error 500 era incorrecta y que faltaba un caso límite relevante. |
 | [D2] Corregir la descripción del PR con los resultados reales de curl (categoría `Libros`, resultados observados, caso `maxPrice=`, entradas inválidas que devuelven 200 con lista vacía). Sin modificar archivos. | ⚠️ Acción incorrecta. En lugar de solo corregir la descripción, la IA intentó ejecutar `rm -f` sobre archivos `.txt` del repositorio (mis exportaciones de conversación), que habían quedado seleccionados en el editor y entraron como contexto. | Rechacé el comando y le indiqué que no borrara ningún archivo y continuara solo con la corrección de la descripción, sin ejecutar comandos ni modificar archivos. | La acción no fue solicitada, era destructiva e irreversible, y contradecía la instrucción "No modifiques archivos". Moví yo mismo las exportaciones fuera del repositorio. |
 | [D2] No borrar ningún archivo y continuar solo con la corrección de la descripción del PR, sin ejecutar comandos ni modificar archivos. | Descripción corregida: categoría `Libros`, resultados observados en el checklist, caso `maxPrice=` agregado y aclaración de que las entradas inválidas o vacías devuelven 200 con lista vacía. Respetó la instrucción de no tocar archivos. Solo ajusté a mano "(rango inclusivo)" por "(rango inclusivo según `BETWEEN`)", porque lo inclusivo sale del código y no de las pruebas. | — | No fue necesario; cada afirmación verificada contra el diff y las pruebas con curl. |
+| [D3] Describí la lentitud de `GET /api/products` con mi medición y pedí identificar el cuello de botella: cuántas consultas se ejecutan por request, `EXPLAIN QUERY PLAN` de las consultas involucradas y citas de archivos y líneas. Sin modificar archivos. | 🔁 Iteración. Diagnóstico correcto: patrón N+1 (501 consultas por request, `server/src/routes/products.js:37-40`) y todas las consultas con `SCAN products`, sin índices aparte de la clave primaria. Pero afirmó que eliminar el N+1 sin agregar un índice no resolvería el problema, contradiciendo su propia observación de que escanear 500 filas es barato. | Pedí empezar por el cambio mínimo (eliminar el N+1), mantener exactamente el contrato (en particular, que `cheaperInCategory` cuente sobre toda la categoría aunque haya filtros de precio) y justificar si el índice es necesario o si podemos medir primero sin él. Mostrar el diff antes de aplicar. | La afirmación sobre el índice no estaba demostrada y era inconsistente con el propio análisis; agregar un índice implica un cambio de esquema que debe justificarse con evidencia. |
+| [D3] Pedí eliminar el N+1 como cambio mínimo, manteniendo exactamente el contrato (en particular, `cheaperInCategory` sobre toda la categoría aunque haya filtros de precio) y justificar si el índice es necesario. | ⚠️ Sugerencia incompleta. Reemplazó las 500 consultas por un self-join (`LEFT JOIN products b ON b.category = a.category AND b.price < a.price`) sobre toda la tabla: 2 consultas por request y valores idénticos (verificado por la IA, 0 discrepancias). Pero al medir con 50 peticiones: sin filtros bajó de 23,9 ms a 10,4 ms, mientras que el caso filtrado (1 producto) subió de 0,9 ms a 7,9 ms. | Pedí reemplazar el self-join por la función de ventana `RANK() OVER (PARTITION BY category ORDER BY price) - 1`, calculada en una sola pasada sobre toda la tabla, manteniendo el mismo contrato y explicando por qué da el mismo resultado. | La propuesta mejoraba un caso a costa de otro: el self-join tiene un costo fijo sobre toda la tabla en cada petición. Lo detecté midiendo también el caso filtrado, que la IA no había considerado. |
+| [D3] Con mis mediciones como evidencia, pedí reemplazar el self-join por `RANK() OVER (PARTITION BY category ORDER BY price) - 1`, calculado en una sola pasada sobre toda la tabla, manteniendo el mismo contrato y explicando por qué da el mismo resultado. Mostrar el diff antes de aplicar. | Diff correcto y más simple (lookup por `id`). Explicó correctamente la equivalencia con el conteo estricto, incluidos los empates, y la verificó con los 500 productos (0 discrepancias). Plan: un solo `SCAN products` con `USE TEMP B-TREE FOR ORDER BY`. Mediciones (50 peticiones): sin filtros 23,9 → 3,6 ms; filtrado 0,9 → 1,8 ms. Respuestas del endpoint idénticas antes y después (`cmp`). | — | No fue necesario. Acepté la compensación en el caso filtrado (+0,9 ms, por el costo fijo de ordenar la tabla completa) a cambio de que el caso principal sea ~6,6 veces más rápido, y la documenté en el README. |
 
 > Nota: varios prompts corregidos se redactaron con apoyo de Claude (chat en claude.ai) como segunda opinión, para revisar críticamente las respuestas de Claude Code. Todas las verificaciones se hicieron manualmente.
