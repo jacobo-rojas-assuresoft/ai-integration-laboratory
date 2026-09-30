@@ -26,29 +26,37 @@ function App() {
       .catch(() => setCategories([]));
   }, []);
 
-  useEffect(() => {
-    setLoading(true);
-    setError(null);
+  const loadProducts = (category, { silent = false } = {}) => {
+    if (!silent) {
+      setLoading(true);
+      setError(null);
+    }
     const url =
-      selectedCategory === CATEGORY_ALL
-        ? '/api/products'
-        : `/api/products?category=${encodeURIComponent(selectedCategory)}`;
+      category === CATEGORY_ALL ? '/api/products' : `/api/products?category=${encodeURIComponent(category)}`;
 
-    fetch(url)
+    return fetch(url)
       .then((res) => {
         if (!res.ok) throw new Error('No se pudieron cargar los productos.');
         return res.json();
       })
       .then(setProducts)
-      .catch((err) => setError(err.message))
-      .finally(() => setLoading(false));
+      .catch((err) => {
+        if (!silent) setError(err.message);
+      })
+      .finally(() => {
+        if (!silent) setLoading(false);
+      });
+  };
+
+  useEffect(() => {
+    loadProducts(selectedCategory);
   }, [selectedCategory]);
 
   const addToCart = (product) => {
     setCart((prev) => {
       const existing = prev.find((item) => item.productId === product.id);
       if (existing) {
-        if (existing.quantity > product.stock) return prev;
+        if (existing.quantity + 1 > product.stock) return prev;
         return prev.map((item) =>
           item.productId === product.id ? { ...item, quantity: item.quantity + 1 } : item,
         );
@@ -90,7 +98,14 @@ function App() {
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || 'No se pudo crear la orden.');
       setOrderStatus({ type: 'success', message: `Orden #${data.id} creada. Total: ${formatPrice(data.total)}` });
+      setProducts((prev) =>
+        prev.map((product) => {
+          const purchased = cart.find((item) => item.productId === product.id);
+          return purchased ? { ...product, stock: product.stock - purchased.quantity } : product;
+        }),
+      );
       setCart([]);
+      loadProducts(selectedCategory, { silent: true });
     } catch (err) {
       setOrderStatus({ type: 'error', message: err.message });
     }
@@ -128,25 +143,38 @@ function App() {
 
           {!loading && !error && (
             <ul className="product-list" data-testid="product-list">
-              {products.map((product) => (
-                <li key={product.id} className="product-card" data-testid={`product-${product.id}`}>
-                  <div className="product-info">
-                    <h3>{product.name}</h3>
-                    <p className="category">{product.category}</p>
-                    <p className="price">{formatPrice(product.price)}</p>
-                    <p className="stock">Stock: {product.stock}</p>
-                  </div>
-                  <button
-                    type="button"
-                    onClick={() => addToCart(product)}
-                    disabled={product.stock <= 0}
-                    aria-label={`Agregar ${product.name} al carrito`}
-                    data-testid={`add-to-cart-${product.id}`}
-                  >
-                    {product.stock <= 0 ? 'Sin stock' : 'Agregar al carrito'}
-                  </button>
-                </li>
-              ))}
+              {products.map((product) => {
+                const cartQuantity = cart.find((item) => item.productId === product.id)?.quantity ?? 0;
+                const availableStock = product.stock - cartQuantity;
+                const maxReached = product.stock > 0 && availableStock <= 0;
+
+                return (
+                  <li key={product.id} className="product-card" data-testid={`product-${product.id}`}>
+                    <div className="product-info">
+                      <h3>{product.name}</h3>
+                      <p className="category">{product.category}</p>
+                      <p className="price">{formatPrice(product.price)}</p>
+                      <p className="stock">
+                        Stock: {availableStock}
+                        {maxReached && (
+                          <span className="stock-max" data-testid={`stock-max-${product.id}`}>
+                            {' '}(máximo en el carrito)
+                          </span>
+                        )}
+                      </p>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => addToCart(product)}
+                      disabled={availableStock <= 0}
+                      aria-label={`Agregar ${product.name} al carrito`}
+                      data-testid={`add-to-cart-${product.id}`}
+                    >
+                      {product.stock <= 0 ? 'Sin stock' : maxReached ? 'Máximo alcanzado' : 'Agregar al carrito'}
+                    </button>
+                  </li>
+                );
+              })}
             </ul>
           )}
         </section>

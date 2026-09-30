@@ -7,18 +7,43 @@ const SELECT_ALL = db.prepare('SELECT id, name, category, price, stock FROM prod
 const SELECT_BY_CATEGORY = db.prepare(
   'SELECT id, name, category, price, stock FROM products WHERE category = ? ORDER BY id',
 );
-const COUNT_CHEAPER_IN_CATEGORY = db.prepare(
-  'SELECT COUNT(*) AS count FROM products WHERE category = ? AND price < ?',
+const SELECT_BY_PRICE_RANGE = db.prepare(
+  'SELECT id, name, category, price, stock FROM products WHERE price BETWEEN ? AND ? ORDER BY id',
 );
+const SELECT_BY_CATEGORY_AND_PRICE_RANGE = db.prepare(
+  'SELECT id, name, category, price, stock FROM products WHERE category = ? AND price BETWEEN ? AND ? ORDER BY id',
+);
+const CHEAPER_RANKS = db.prepare(`
+  SELECT id, RANK() OVER (PARTITION BY category ORDER BY price) - 1 AS cheaperInCategory
+  FROM products
+`);
 
 productsRouter.get('/', (req, res) => {
-  const { category } = req.query;
-  const rows = category ? SELECT_BY_CATEGORY.all(category) : SELECT_ALL.all();
+  const { category, minPrice, maxPrice } = req.query;
+  const min = minPrice !== undefined ? Number(minPrice) : 0;
+  const max = maxPrice !== undefined ? Number(maxPrice) : Number.MAX_SAFE_INTEGER;
+  const hasPriceRange = minPrice !== undefined || maxPrice !== undefined;
 
-  const withRanking = rows.map((row) => {
-    const { count } = COUNT_CHEAPER_IN_CATEGORY.get(row.category, row.price);
-    return { ...row, cheaperInCategory: count };
-  });
+  let rows;
+  if (category && hasPriceRange) {
+    rows = SELECT_BY_CATEGORY_AND_PRICE_RANGE.all(category, min, max);
+  } else if (hasPriceRange) {
+    rows = SELECT_BY_PRICE_RANGE.all(min, max);
+  } else if (category) {
+    rows = SELECT_BY_CATEGORY.all(category);
+  } else {
+    rows = SELECT_ALL.all();
+  }
+
+  const cheaperById = new Map();
+  for (const { id, cheaperInCategory } of CHEAPER_RANKS.all()) {
+    cheaperById.set(id, cheaperInCategory);
+  }
+
+  const withRanking = rows.map((row) => ({
+    ...row,
+    cheaperInCategory: cheaperById.get(row.id) ?? 0,
+  }));
 
   res.json(withRanking);
 });
